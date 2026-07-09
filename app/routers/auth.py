@@ -75,12 +75,23 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
 @router.post("/refresh")
 def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
+    from ..auth import _revoked_refresh_tokens
+    
     data = decode_token(payload.refresh_token)
     if data.get("type") != "refresh":
         raise AppError(401, "UNAUTHORIZED", "Wrong token type")
+    
+    # Check if refresh token was already used
+    if data.get("jti") in _revoked_refresh_tokens:
+        raise AppError(401, "UNAUTHORIZED", "Refresh token has already been used")
+    
     user = db.query(User).filter(User.id == int(data["sub"])).first()
     if user is None:
         raise AppError(401, "UNAUTHORIZED", "Unknown user")
+    
+    # Invalidate the presented refresh token (single-use)
+    _revoked_refresh_tokens.add(data.get("jti"))
+    
     return {
         "access_token": create_access_token(user),
         "refresh_token": create_refresh_token(user),
