@@ -1,0 +1,1961 @@
+================================================================================
+CODEBASE EXPORT
+Generated: 2026-07-09 18:22:01
+Root Path: /mnt/data/Documents/Personal Items/Hackathon/ICT_FEST/ICT_Fest_Hackathon_Preliminary
+================================================================================
+
+FOLDER STRUCTURE
+--------------------------------------------------------------------------------
+
+ICT_Fest_Hackathon_Preliminary/
+├── .dockerignore
+├── .gitignore
+├── Dockerfile
+├── README.md
+├── app
+│   ├── __init__.py
+│   ├── auth.py
+│   ├── cache.py
+│   ├── config.py
+│   ├── database.py
+│   ├── errors.py
+│   ├── main.py
+│   ├── models.py
+│   ├── routers
+│   │   ├── __init__.py
+│   │   ├── admin.py
+│   │   ├── auth.py
+│   │   ├── bookings.py
+│   │   ├── health.py
+│   │   └── rooms.py
+│   ├── schemas.py
+│   ├── serializers.py
+│   ├── services
+│   │   ├── __init__.py
+│   │   ├── export.py
+│   │   ├── notifications.py
+│   │   ├── ratelimit.py
+│   │   ├── reference.py
+│   │   ├── refunds.py
+│   │   └── stats.py
+│   └── timeutils.py
+├── codebase_export.txt
+├── docker-compose.yml
+├── export_codebase.py
+├── requirements.txt
+└── tests
+    ├── __init__.py
+    └── test_smoke.py
+
+================================================================================
+
+FILE CONTENTS
+--------------------------------------------------------------------------------
+
+
+================================================================================
+FILE: .dockerignore
+================================================================================
+__pycache__/
+*.pyc
+*.db
+.venv/
+venv/
+.git/
+PROJECT_SPEC.md
+
+================================================================================
+FILE: .gitignore
+================================================================================
+__pycache__/
+*.pyc
+*.db
+.venv/
+venv/
+.pytest_cache/
+
+================================================================================
+FILE: Dockerfile
+================================================================================
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+================================================================================
+FILE: README.md
+================================================================================
+# CoWork — Coworking Space Booking API
+
+CoWork is a REST API for managing bookable rooms inside a coworking space across
+multiple tenant organizations. Each organization has its own rooms, staff
+(admins), and members. Members book rooms for time slots; admins manage rooms and
+pull reports.
+
+## Stack
+
+- Python 3.11, FastAPI, SQLAlchemy, SQLite (single file, no external DB service)
+- JWT auth (access + refresh tokens), HS256, secret from the `JWT_SECRET` env var
+- One container, served on **port 8000**
+
+## Setup
+
+```bash
+docker compose up --build
+```
+
+The database schema is created automatically on first startup — no manual
+provisioning or seed scripts. The API listens on `http://localhost:8000`.
+
+To run the smoke test locally:
+
+```bash
+pip install -r requirements.txt
+pytest
+```
+
+## Business rules
+
+1. **Datetimes.** All API datetimes are ISO 8601. Input datetimes carrying a UTC
+   offset are converted to UTC before storage or comparison; naive input is
+   treated as UTC. All response datetimes are UTC with an explicit UTC designator
+   (`Z` or `+00:00`).
+2. **Booking price.** `price_cents = hourly_rate_cents × duration_hours`. Duration
+   must be a whole number of hours, minimum 1, maximum 8. `end_time` must be
+   strictly after `start_time`. `start_time` must be strictly in the future at
+   request time — no grace window of any size.
+3. **No double-booking.** Two `confirmed` bookings for the same room overlap iff
+   `existing.start_time < new.end_time AND new.start_time < existing.end_time`.
+   Back-to-back bookings (one ending exactly when the other starts) are allowed.
+   Conflict → `409 ROOM_CONFLICT`. Holds under concurrent requests.
+4. **Booking quota.** A member may hold at most 3 `confirmed` bookings with
+   `start_time` in the window `(now, now + 24h]`, across all rooms in their org.
+   Violation → `409 QUOTA_EXCEEDED`. Holds under concurrent requests.
+5. **Rate limit.** `POST /bookings` is limited to 20 requests per rolling 60
+   seconds per user (all requests count, successful or not). Excess →
+   `429 RATE_LIMITED`. Holds under concurrent requests.
+6. **Cancellation refund policy.** Only the booking's owner or an admin of the
+   same org may cancel. Notice = `start_time − cancellation_time`:
+   - notice ≥ 48 hours → 100% refund
+   - 24 hours ≤ notice < 48 hours → 50% refund
+   - notice < 24 hours → 0% refund
+
+   Refund amount = percentage of `price_cents`, rounded to the nearest cent with
+   half-cents rounding up (e.g. 50% of 1001 = 501). Cancelling an
+   already-cancelled booking → `409 ALREADY_CANCELLED`. A cancelled booking has
+   exactly one RefundLog entry, and the amount returned by the cancel response
+   equals the amount stored in the RefundLog. Holds under concurrent cancel
+   requests for the same booking.
+7. **Reference codes.** Every booking's `reference_code` is unique, including
+   under concurrent creation.
+8. **Auth.** Tokens are JWTs (HS256) with claims `sub` (user id, string), `org`
+   (org id), `role`, `jti` (unique per token), `iat`, `exp`, `type`
+   (`access` | `refresh`). Access tokens: `exp − iat` = exactly 900 seconds.
+   Refresh tokens: 7 days. Logout immediately invalidates the presented access
+   token for all further use (subsequent use → `401`). Refresh tokens are
+   single-use: `POST /auth/refresh` returns a new access **and** refresh token and
+   invalidates the presented refresh token (reuse → `401`).
+9. **Multi-tenancy.** A user (including admins) may only ever read or act on data
+   (rooms, bookings, reports, exports, availability, stats) belonging to their own
+   organization, on every code path. Cross-org resource IDs behave as
+   non-existent → `404`.
+10. **Booking visibility.** Members may read and cancel only their own bookings
+    (another member's booking id → `404 BOOKING_NOT_FOUND`). Admins may read and
+    cancel any booking in their org.
+11. **Pagination & ordering.** `GET /bookings` takes `page` (int ≥ 1, default 1)
+    and `limit` (int 1–100, default 10). Items are the caller's own bookings
+    sorted by ascending `start_time` (ties by ascending `id`). Page N with limit L
+    returns items `[(N−1)·L, N·L)` of that ordering; sequential pages never skip
+    or repeat items. Response includes `total`.
+12. **Usage report.** `GET /admin/usage-report?from=YYYY-MM-DD&to=YYYY-MM-DD`
+    returns, per room in the caller's org (including rooms with zero bookings),
+    the count of `confirmed` bookings with `start_time` on a date in `[from, to]`
+    (UTC, inclusive) and their summed `price_cents`. Cancelled bookings are
+    excluded. The report reflects the current state immediately.
+13. **Availability.** `GET /rooms/{id}/availability?date=YYYY-MM-DD` returns the
+    room's `confirmed` bookings starting on that UTC date as busy intervals,
+    sorted ascending. Reflects the current state immediately.
+14. **Room stats.** `GET /rooms/{id}/stats` returns the room's current count of
+    `confirmed` bookings and their summed `price_cents` (cancellation decrements
+    both). Always equals the values derivable from the bookings themselves.
+15. **Registration.** `POST /auth/register` with an unknown `org_name` creates the
+    org and the user as `admin`; with a known `org_name` it joins the caller as
+    `member`. A duplicate username within the org → `409 USERNAME_TAKEN`.
+16. **Liveness.** The service responds to all endpoints at all times; no
+    combination of concurrent valid requests may hang the service.
+
+## API contract
+
+### Endpoints
+
+| Method | Path | Auth | Success | Description |
+|---|---|---|---|---|
+| POST | `/auth/register` | No | 201 | Register org admin or join org as member |
+| POST | `/auth/login` | No | 200 | Returns access + refresh token |
+| POST | `/auth/refresh` | No (refresh token in body) | 200 | Rotates tokens |
+| POST | `/auth/logout` | Yes | 200 | Invalidates presented access token |
+| GET | `/rooms` | Yes | 200 | List rooms in caller's org |
+| POST | `/rooms` | Yes (admin) | 201 | Create a room |
+| GET | `/rooms/{id}/availability` | Yes | 200 | Busy intervals for a date |
+| GET | `/rooms/{id}/stats` | Yes | 200 | Live confirmed-booking count & revenue |
+| POST | `/bookings` | Yes | 201 | Create a booking |
+| GET | `/bookings` | Yes | 200 | Caller's bookings, paginated |
+| GET | `/bookings/{id}` | Yes | 200 | Single booking incl. refunds |
+| POST | `/bookings/{id}/cancel` | Yes | 200 | Cancel + refund calculation |
+| GET | `/admin/usage-report` | Yes (admin) | 200 | Per-room usage/revenue for range |
+| GET | `/admin/export` | Yes (admin) | 200 | Bookings CSV; `room_id`, `include_all` |
+| GET | `/health` | No | 200 | `{"status": "ok"}` |
+
+### Request/response schemas (exact field names)
+
+- `POST /auth/register` body `{org_name, username, password}` →
+  `{user_id, org_id, username, role}`
+- `POST /auth/login` body `{org_name, username, password}` →
+  `{access_token, refresh_token, token_type: "bearer"}`; bad credentials →
+  `401 INVALID_CREDENTIALS`
+- `POST /auth/refresh` body `{refresh_token}` → same shape as login
+- Room: `{id, org_id, name, capacity, hourly_rate_cents}`;
+  `POST /rooms` body `{name, capacity, hourly_rate_cents}`
+- Availability: `{room_id, date, busy: [{start_time, end_time}, …]}`
+- Stats: `{room_id, total_confirmed_bookings, total_revenue_cents}`
+- `POST /bookings` body `{room_id, start_time, end_time}` → Booking:
+  `{id, reference_code, room_id, user_id, start_time, end_time, status,
+  price_cents, created_at}`
+- `GET /bookings` → `{items: [Booking, …], page, limit, total}`
+- `GET /bookings/{id}` → Booking plus
+  `refunds: [{amount_cents, status, processed_at}, …]`
+- `POST /bookings/{id}/cancel` →
+  `{id, status: "cancelled", refund_percent, refund_amount_cents}`
+- Usage report → `{from, to, rooms: [{room_id, room_name, confirmed_bookings,
+  revenue_cents}, …]}`
+- Export CSV header (exact):
+  `id,reference_code,room_id,user_id,start_time,end_time,status,price_cents`
+
+### Errors
+
+Application errors return JSON `{"detail": <string>, "code": <CODE>}` with codes:
+`USERNAME_TAKEN` (409), `INVALID_CREDENTIALS` (401), `ROOM_CONFLICT` (409),
+`QUOTA_EXCEEDED` (409), `RATE_LIMITED` (429), `ALREADY_CANCELLED` (409),
+`BOOKING_NOT_FOUND` (404), `ROOM_NOT_FOUND` (404), `FORBIDDEN` (403),
+`INVALID_BOOKING_WINDOW` (400 — past start, non-whole/out-of-range duration, or
+`end_time ≤ start_time`). Missing/invalid/expired/blacklisted tokens → 401.
+Framework validation errors (422) use FastAPI's default shape.
+
+## Grading
+
+**Your fixes must preserve this contract exactly** (paths, status codes, error
+codes, JSON field names, JWT claims). Grading is **black-box**: the grader builds
+the container and asserts behavior against the business rules and API contract
+above by talking to the API only.
+
+================================================================================
+FILE: codebase_export.txt
+================================================================================
+================================================================================
+CODEBASE EXPORT
+Generated: 2026-07-09 18:22:01
+Root Path: /mnt/data/Documents/Personal Items/Hackathon/ICT_FEST/ICT_Fest_Hackathon_Preliminary
+================================================================================
+
+FOLDER STRUCTURE
+--------------------------------------------------------------------------------
+
+ICT_Fest_Hackathon_Preliminary/
+├── .dockerignore
+├── .gitignore
+├── Dockerfile
+├── README.md
+├── app
+│   ├── __init__.py
+│   ├── auth.py
+│   ├── cache.py
+│   ├── config.py
+│   ├── database.py
+│   ├── errors.py
+│   ├── main.py
+│   ├── models.py
+│   ├── routers
+│   │   ├── __init__.py
+│   │   ├── admin.py
+│   │   ├── auth.py
+│   │   ├── bookings.py
+│   │   ├── health.py
+│   │   └── rooms.py
+│   ├── schemas.py
+│   ├── serializers.py
+│   ├── services
+│   │   ├── __init__.py
+│   │   ├── export.py
+│   │   ├── notifications.py
+│   │   ├── ratelimit.py
+│   │   ├── reference.py
+│   │   ├── refunds.py
+│   │   └── stats.py
+│   └── timeutils.py
+├── codebase_export.txt
+├── docker-compose.yml
+├── export_codebase.py
+├── requirements.txt
+└── tests
+    ├── __init__.py
+    └── test_smoke.py
+
+================================================================================
+
+FILE CONTENTS
+--------------------------------------------------------------------------------
+
+
+================================================================================
+FILE: .dockerignore
+================================================================================
+__pycache__/
+*.pyc
+*.db
+.venv/
+venv/
+.git/
+PROJECT_SPEC.md
+
+================================================================================
+FILE: .gitignore
+================================================================================
+__pycache__/
+*.pyc
+*.db
+.venv/
+venv/
+.pytest_cache/
+
+================================================================================
+FILE: Dockerfile
+================================================================================
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+================================================================================
+FILE: README.md
+================================================================================
+# CoWork — Coworking Space Booking API
+
+CoWork is a REST API for managing bookable rooms inside a coworking space across
+multiple tenant organizations. Each organization has its own rooms, staff
+(admins), and members. Members book rooms for time slots; admins manage rooms and
+pull reports.
+
+## Stack
+
+- Python 3.11, FastAPI, SQLAlchemy, SQLite (single file, no external DB service)
+- JWT auth (access + refresh tokens), HS256, secret from the `JWT_SECRET` env var
+- One container, served on **port 8000**
+
+## Setup
+
+```bash
+docker compose up --build
+```
+
+The database schema is created automatically on first startup — no manual
+provisioning or seed scripts. The API listens on `http://localhost:8000`.
+
+To run the smoke test locally:
+
+```bash
+pip install -r requirements.txt
+pytest
+```
+
+## Business rules
+
+1. **Datetimes.** All API datetimes are ISO 8601. Input datetimes carrying a UTC
+   offset are converted to UTC before storage or comparison; naive input is
+   treated as UTC. All response datetimes are UTC with an explicit UTC designator
+   (`Z` or `+00:00`).
+2. **Booking price.** `price_cents = hourly_rate_cents × duration_hours`. Duration
+   must be a whole number of hours, minimum 1, maximum 8. `end_time` must be
+   strictly after `start_time`. `start_time` must be strictly in the future at
+   request time — no grace window of any size.
+3. **No double-booking.** Two `confirmed` bookings for the same room overlap iff
+   `existing.start_time < new.end_time AND new.start_time < existing.end_time`.
+   Back-to-back bookings (one ending exactly when the other starts) are allowed.
+   Conflict → `409 ROOM_CONFLICT`. Holds under concurrent requests.
+4. **Booking quota.** A member may hold at most 3 `confirmed` bookings with
+   `start_time` in the window `(now, now + 24h]`, across all rooms in their org.
+   Violation → `409 QUOTA_EXCEEDED`. Holds under concurrent requests.
+5. **Rate limit.** `POST /bookings` is limited to 20 requests per rolling 60
+   seconds per user (all requests count, successful or not). Excess →
+   `429 RATE_LIMITED`. Holds under concurrent requests.
+6. **Cancellation refund policy.** Only the booking's owner or an admin of the
+   same org may cancel. Notice = `start_time − cancellation_time`:
+   - notice ≥ 48 hours → 100% refund
+   - 24 hours ≤ notice < 48 hours → 50% refund
+   - notice < 24 hours → 0% refund
+
+   Refund amount = percentage of `price_cents`, rounded to the nearest cent with
+   half-cents rounding up (e.g. 50% of 1001 = 501). Cancelling an
+   already-cancelled booking → `409 ALREADY_CANCELLED`. A cancelled booking has
+   exactly one RefundLog entry, and the amount returned by the cancel response
+   equals the amount stored in the RefundLog. Holds under concurrent cancel
+   requests for the same booking.
+7. **Reference codes.** Every booking's `reference_code` is unique, including
+   under concurrent creation.
+8. **Auth.** Tokens are JWTs (HS256) with claims `sub` (user id, string), `org`
+   (org id), `role`, `jti` (unique per token), `iat`, `exp`, `type`
+   (`access` | `refresh`). Access tokens: `exp − iat` = exactly 900 seconds.
+   Refresh tokens: 7 days. Logout immediately invalidates the presented access
+   token for all further use (subsequent use → `401`). Refresh tokens are
+   single-use: `POST /auth/refresh` returns a new access **and** refresh token and
+   invalidates the presented refresh token (reuse → `401`).
+9. **Multi-tenancy.** A user (including admins) may only ever read or act on data
+   (rooms, bookings, reports, exports, availability, stats) belonging to their own
+   organization, on every code path. Cross-org resource IDs behave as
+   non-existent → `404`.
+10. **Booking visibility.** Members may read and cancel only their own bookings
+    (another member's booking id → `404 BOOKING_NOT_FOUND`). Admins may read and
+    cancel any booking in their org.
+11. **Pagination & ordering.** `GET /bookings` takes `page` (int ≥ 1, default 1)
+    and `limit` (int 1–100, default 10). Items are the caller's own bookings
+    sorted by ascending `start_time` (ties by ascending `id`). Page N with limit L
+    returns items `[(N−1)·L, N·L)` of that ordering; sequential pages never skip
+    or repeat items. Response includes `total`.
+12. **Usage report.** `GET /admin/usage-report?from=YYYY-MM-DD&to=YYYY-MM-DD`
+    returns, per room in the caller's org (including rooms with zero bookings),
+    the count of `confirmed` bookings with `start_time` on a date in `[from, to]`
+    (UTC, inclusive) and their summed `price_cents`. Cancelled bookings are
+    excluded. The report reflects the current state immediately.
+13. **Availability.** `GET /rooms/{id}/availability?date=YYYY-MM-DD` returns the
+    room's `confirmed` bookings starting on that UTC date as busy intervals,
+    sorted ascending. Reflects the current state immediately.
+14. **Room stats.** `GET /rooms/{id}/stats` returns the room's current count of
+    `confirmed` bookings and their summed `price_cents` (cancellation decrements
+    both). Always equals the values derivable from the bookings themselves.
+15. **Registration.** `POST /auth/register` with an unknown `org_name` creates the
+    org and the user as `admin`; with a known `org_name` it joins the caller as
+    `member`. A duplicate username within the org → `409 USERNAME_TAKEN`.
+16. **Liveness.** The service responds to all endpoints at all times; no
+    combination of concurrent valid requests may hang the service.
+
+## API contract
+
+### Endpoints
+
+| Method | Path | Auth | Success | Description |
+|---|---|---|---|---|
+| POST | `/auth/register` | No | 201 | Register org admin or join org as member |
+| POST | `/auth/login` | No | 200 | Returns access + refresh token |
+| POST | `/auth/refresh` | No (refresh token in body) | 200 | Rotates tokens |
+| POST | `/auth/logout` | Yes | 200 | Invalidates presented access token |
+| GET | `/rooms` | Yes | 200 | List rooms in caller's org |
+| POST | `/rooms` | Yes (admin) | 201 | Create a room |
+| GET | `/rooms/{id}/availability` | Yes | 200 | Busy intervals for a date |
+| GET | `/rooms/{id}/stats` | Yes | 200 | Live confirmed-booking count & revenue |
+| POST | `/bookings` | Yes | 201 | Create a booking |
+| GET | `/bookings` | Yes | 200 | Caller's bookings, paginated |
+| GET | `/bookings/{id}` | Yes | 200 | Single booking incl. refunds |
+| POST | `/bookings/{id}/cancel` | Yes | 200 | Cancel + refund calculation |
+| GET | `/admin/usage-report` | Yes (admin) | 200 | Per-room usage/revenue for range |
+| GET | `/admin/export` | Yes (admin) | 200 | Bookings CSV; `room_id`, `include_all` |
+| GET | `/health` | No | 200 | `{"status": "ok"}` |
+
+### Request/response schemas (exact field names)
+
+- `POST /auth/register` body `{org_name, username, password}` →
+  `{user_id, org_id, username, role}`
+- `POST /auth/login` body `{org_name, username, password}` →
+  `{access_token, refresh_token, token_type: "bearer"}`; bad credentials →
+  `401 INVALID_CREDENTIALS`
+- `POST /auth/refresh` body `{refresh_token}` → same shape as login
+- Room: `{id, org_id, name, capacity, hourly_rate_cents}`;
+  `POST /rooms` body `{name, capacity, hourly_rate_cents}`
+- Availability: `{room_id, date, busy: [{start_time, end_time}, …]}`
+- Stats: `{room_id, total_confirmed_bookings, total_revenue_cents}`
+- `POST /bookings` body `{room_id, start_time, end_time}` → Booking:
+  `{id, reference_code, room_id, user_id, start_time, end_time, status,
+  price_cents, created_at}`
+- `GET /bookings` → `{items: [Booking, …], page, limit, total}`
+- `GET /bookings/{id}` → Booking plus
+  `refunds: [{amount_cents, status, processed_at}, …]`
+- `POST /bookings/{id}/cancel` →
+  `{id, status: "cancelled", refund_percent, refund_amount_cents}`
+- Usage report → `{from, to, rooms: [{room_id, room_name, confirmed_bookings,
+  revenue_cents}, …]}`
+- Export CSV header (exact):
+  `id,reference_code,room_id,user_id,start_time,end_time,status,price_cents`
+
+### Errors
+
+Application errors return JSON `{"detail": <string>, "code": <CODE>}` with codes:
+`USERNAME_TAKEN` (409), `INVALID_CREDENTIALS` (401), `ROOM_CONFLICT` (409),
+`QUOTA_EXCEEDED` (409), `RATE_LIMITED` (429), `ALREADY_CANCELLED` (409),
+`BOOKING_NOT_FOUND` (404), `ROOM_NOT_FOUND` (404), `FORBIDDEN` (403),
+`INVALID_BOOKING_WINDOW` (400 — past start, non-whole/out-of-range duration, or
+`end_time ≤ start_time`). Missing/invalid/expired/blacklisted tokens → 401.
+Framework validation errors (422) use FastAPI's default shape.
+
+## Grading
+
+**Your fixes must preserve this contract exactly** (paths, status codes, error
+codes, JSON field names, JWT claims). Grading is **black-box**: the grader builds
+the container and asserts behavior against the business rules and API contract
+above by talking to the API only.
+
+================================================================================
+FILE: docker-compose.yml
+================================================================================
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - JWT_SECRET=cowork-dev-secret-change-me
+      - DATABASE_URL=sqlite:////app/data/cowork.db
+    volumes:
+      - cowork-data:/app/data
+
+volumes:
+  cowork-data:
+
+================================================================================
+FILE: export_codebase.py
+================================================================================
+#!/usr/bin/env python3
+"""
+Script to export entire codebase and folder structure to a text file.
+"""
+
+import os
+import sys
+from pathlib import Path
+from datetime import datetime
+
+
+def should_skip(path):
+    """Check if a file or directory should be skipped."""
+    skip_dirs = {
+        '__pycache__', '.git', '.venv', 'venv', 'env', 
+        '.pytest_cache', '.egg-info', 'dist', 'build',
+        '.env', '.DS_Store', '.vscode', 'node_modules'
+    }
+    skip_extensions = {'.pyc', '.pyo', '.pyd', '.so', '.o'}
+    
+    path_obj = Path(path)
+    
+    # Skip specific directories
+    if path_obj.name in skip_dirs:
+        return True
+    
+    # Skip specific file extensions
+    if path_obj.suffix in skip_extensions:
+        return True
+    
+    return False
+
+
+def get_tree_structure(root_path, prefix="", is_last=True):
+    """Generate tree structure representation."""
+    lines = []
+    try:
+        entries = sorted([e for e in os.listdir(root_path) if not should_skip(os.path.join(root_path, e))])
+    except PermissionError:
+        return lines
+    
+    for i, entry in enumerate(entries):
+        path = os.path.join(root_path, entry)
+        is_last_entry = i == len(entries) - 1
+        
+        # Tree characters
+        current_prefix = "└── " if is_last_entry else "├── "
+        next_prefix = "    " if is_last_entry else "│   "
+        
+        lines.append(prefix + current_prefix + entry)
+        
+        # Recursively add subdirectories
+        if os.path.isdir(path):
+            lines.extend(get_tree_structure(path, prefix + next_prefix, is_last_entry))
+    
+    return lines
+
+
+def export_codebase(root_path='.', output_file='codebase_export.txt'):
+    """
+    Export entire codebase to a text file.
+    
+    Args:
+        root_path: Root directory to start from (default: current directory)
+        output_file: Output filename (default: codebase_export.txt)
+    """
+    root_path = os.path.abspath(root_path)
+    output_path = os.path.join(root_path, output_file)
+    
+    print(f"📁 Starting codebase export from: {root_path}")
+    print(f"📝 Output file: {output_path}")
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        # Header
+        f.write("=" * 80 + "\n")
+        f.write(f"CODEBASE EXPORT\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Root Path: {root_path}\n")
+        f.write("=" * 80 + "\n\n")
+        
+        # Folder structure
+        f.write("FOLDER STRUCTURE\n")
+        f.write("-" * 80 + "\n\n")
+        f.write(os.path.basename(root_path) + "/\n")
+        
+        tree_lines = get_tree_structure(root_path)
+        for line in tree_lines:
+            f.write(line + "\n")
+        
+        f.write("\n" + "=" * 80 + "\n\n")
+        
+        # File contents
+        f.write("FILE CONTENTS\n")
+        f.write("-" * 80 + "\n\n")
+        
+        file_count = 0
+        
+        # Walk through all files
+        for dirpath, dirnames, filenames in os.walk(root_path):
+            # Filter out directories to skip
+            dirnames[:] = [d for d in dirnames if not should_skip(os.path.join(dirpath, d))]
+            
+            for filename in sorted(filenames):
+                filepath = os.path.join(dirpath, filename)
+                
+                if should_skip(filepath):
+                    continue
+                
+                # Get relative path
+                rel_path = os.path.relpath(filepath, root_path)
+                
+                # Write file header
+                f.write("\n" + "=" * 80 + "\n")
+                f.write(f"FILE: {rel_path}\n")
+                f.write("=" * 80 + "\n")
+                
+                try:
+                    # Try to read as text
+                    with open(filepath, 'r', encoding='utf-8') as file:
+                        content = file.read()
+                        f.write(content)
+                        if not content.endswith('\n'):
+                            f.write('\n')
+                        file_count += 1
+                except (UnicodeDecodeError, PermissionError):
+                    f.write("[Binary or inaccessible file]\n")
+                    file_count += 1
+        
+        # Footer
+        f.write("\n" + "=" * 80 + "\n")
+        f.write(f"END OF EXPORT\n")
+        f.write(f"Total files exported: {file_count}\n")
+        f.write("=" * 80 + "\n")
+    
+    print(f"✅ Export complete! {file_count} files written to {output_file}")
+
+
+if __name__ == '__main__':
+    # Parse command line arguments
+    root = sys.argv[1] if len(sys.argv) > 1 else '.'
+    output = sys.argv[2] if len(sys.argv) > 2 else 'codebase_export.txt'
+    
+    export_codebase(root, output)
+
+================================================================================
+FILE: requirements.txt
+================================================================================
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+SQLAlchemy==2.0.30
+pydantic==2.7.1
+PyJWT==2.8.0
+
+================================================================================
+FILE: tests/__init__.py
+================================================================================
+
+
+================================================================================
+FILE: tests/test_smoke.py
+================================================================================
+"""Happy-path smoke test covering the core booking flow.
+
+Run with ``pytest`` after installing requirements. It exercises a single,
+sequential golden path and is not a substitute for full API testing.
+"""
+from datetime import datetime, timedelta, timezone
+
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+client = TestClient(app)
+
+
+def _future(hours: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(hours=hours)).replace(
+        minute=0, second=0, microsecond=0
+    ).isoformat()
+
+
+def test_core_flow():
+    assert client.get("/health").json() == {"status": "ok"}
+
+    org = f"acme-{datetime.now().timestamp()}"
+    reg = client.post(
+        "/auth/register",
+        json={"org_name": org, "username": "alice", "password": "pw12345"},
+    )
+    assert reg.status_code == 201
+    assert reg.json()["role"] == "admin"
+
+    login = client.post(
+        "/auth/login",
+        json={"org_name": org, "username": "alice", "password": "pw12345"},
+    )
+    assert login.status_code == 200
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    room = client.post(
+        "/rooms",
+        json={"name": "Focus Room", "capacity": 4, "hourly_rate_cents": 1000},
+        headers=headers,
+    )
+    assert room.status_code == 201
+    room_id = room.json()["id"]
+
+    booking = client.post(
+        "/bookings",
+        json={"room_id": room_id, "start_time": _future(50), "end_time": _future(52)},
+        headers=headers,
+    )
+    assert booking.status_code == 201
+    assert booking.json()["price_cents"] == 2000
+
+    listing = client.get("/bookings", headers=headers)
+    assert listing.status_code == 200
+    assert listing.json()["total"] >= 1
+
+================================================================================
+FILE: app/__init__.py
+================================================================================
+
+
+================================================================================
+FILE: app/auth.py
+================================================================================
+"""Authentication: password hashing, JWT issue/verify, request dependencies."""
+import hashlib
+import hmac
+import os
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import jwt
+from fastapi import Depends, Request
+from sqlalchemy.orm import Session
+
+from .config import (
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+    JWT_ALGORITHM,
+    JWT_SECRET,
+    REFRESH_TOKEN_EXPIRE_DAYS,
+)
+from .database import get_db
+from .errors import AppError
+from .models import User
+
+# Access tokens presented to /auth/logout are recorded here so they can no
+# longer be used.
+_revoked_tokens: set[str] = set()
+
+_PBKDF2_ROUNDS = 100_000
+
+
+def hash_password(password: str) -> str:
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, _PBKDF2_ROUNDS)
+    return f"{salt.hex()}:{dk.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        salt_hex, dk_hex = stored.split(":")
+    except ValueError:
+        return False
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), _PBKDF2_ROUNDS)
+    return hmac.compare_digest(dk.hex(), dk_hex)
+
+
+def _now_ts() -> int:
+    return int(datetime.now(timezone.utc).timestamp())
+
+
+def create_access_token(user: User) -> str:
+    iat = _now_ts()
+    lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES * 60)
+    payload = {
+        "sub": str(user.id),
+        "org": user.org_id,
+        "role": user.role,
+        "jti": uuid.uuid4().hex,
+        "iat": iat,
+        "exp": iat + int(lifetime.total_seconds()),
+        "type": "access",
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def create_refresh_token(user: User) -> str:
+    iat = _now_ts()
+    lifetime = timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    payload = {
+        "sub": str(user.id),
+        "org": user.org_id,
+        "role": user.role,
+        "jti": uuid.uuid4().hex,
+        "iat": iat,
+        "exp": iat + int(lifetime.total_seconds()),
+        "type": "refresh",
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def decode_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.PyJWTError:
+        raise AppError(401, "UNAUTHORIZED", "Invalid or expired token")
+
+
+def revoke_access_token(payload: dict) -> None:
+    _revoked_tokens.add(payload["jti"])
+
+
+def get_token_payload(request: Request) -> dict:
+    header = request.headers.get("Authorization")
+    if not header or not header.startswith("Bearer "):
+        raise AppError(401, "UNAUTHORIZED", "Missing bearer token")
+    token = header[len("Bearer "):].strip()
+    payload = decode_token(token)
+    if payload.get("type") != "access":
+        raise AppError(401, "UNAUTHORIZED", "Wrong token type")
+    if payload.get("sub") in _revoked_tokens:
+        raise AppError(401, "UNAUTHORIZED", "Token has been revoked")
+    return payload
+
+
+def get_current_user(
+    payload: dict = Depends(get_token_payload),
+    db: Session = Depends(get_db),
+) -> User:
+    user = db.query(User).filter(User.id == int(payload["sub"])).first()
+    if user is None:
+        raise AppError(401, "UNAUTHORIZED", "Unknown user")
+    return user
+
+
+def require_admin(user: User = Depends(get_current_user)) -> User:
+    if user.role != "admin":
+        raise AppError(403, "FORBIDDEN", "Admin privileges required")
+    return user
+
+================================================================================
+FILE: app/cache.py
+================================================================================
+"""In-memory response caches for read-heavy reporting endpoints.
+
+Usage reports and per-room availability are relatively expensive to compute and
+are read far more often than the underlying data changes, so results are cached
+and invalidated when the data they depend on is modified.
+"""
+
+_report_cache: dict[tuple, dict] = {}
+_availability_cache: dict[tuple, dict] = {}
+
+
+def get_report(org_id: int, frm: str, to: str):
+    return _report_cache.get((org_id, frm, to))
+
+
+def set_report(org_id: int, frm: str, to: str, value: dict) -> None:
+    _report_cache[(org_id, frm, to)] = value
+
+
+def invalidate_report(org_id: int) -> None:
+    for key in [k for k in _report_cache if k[0] == org_id]:
+        _report_cache.pop(key, None)
+
+
+def get_availability(room_id: int, date: str):
+    return _availability_cache.get((room_id, date))
+
+
+def set_availability(room_id: int, date: str, value: dict) -> None:
+    _availability_cache[(room_id, date)] = value
+
+
+def invalidate_availability(room_id: int, date: str) -> None:
+    _availability_cache.pop((room_id, date), None)
+
+================================================================================
+FILE: app/config.py
+================================================================================
+"""Application configuration.
+
+Values are read from the environment so the same image can run in different
+deployments. Sensible defaults are provided for local development.
+"""
+import os
+
+JWT_SECRET = os.getenv("JWT_SECRET", "cowork-dev-secret-change-me")
+JWT_ALGORITHM = "HS256"
+
+ACCESS_TOKEN_EXPIRE_MINUTES = 15
+REFRESH_TOKEN_EXPIRE_DAYS = 7
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./cowork.db")
+
+================================================================================
+FILE: app/database.py
+================================================================================
+"""Database engine and session management."""
+from sqlalchemy import create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+from .config import DATABASE_URL
+
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False, "timeout": 30},
+)
+
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+Base = declarative_base()
+
+
+def get_db():
+    """Yield a request-scoped database session."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+================================================================================
+FILE: app/errors.py
+================================================================================
+"""Application-level error type and JSON representation.
+
+Every business-rule violation raises :class:`AppError`, which is rendered as
+``{"detail": <string>, "code": <CODE>}`` with the appropriate HTTP status.
+"""
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+
+class AppError(Exception):
+    def __init__(self, status_code: int, code: str, detail: str):
+        self.status_code = status_code
+        self.code = code
+        self.detail = detail
+        super().__init__(detail)
+
+
+async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "code": exc.code},
+    )
+
+================================================================================
+FILE: app/main.py
+================================================================================
+"""CoWork API application entrypoint."""
+from fastapi import FastAPI
+
+from .database import Base, engine
+from .errors import AppError, app_error_handler
+from .routers import admin, auth, bookings, health, rooms
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="CoWork API", version="1.0.0")
+
+app.add_exception_handler(AppError, app_error_handler)
+
+app.include_router(health.router)
+app.include_router(auth.router)
+app.include_router(rooms.router)
+app.include_router(bookings.router)
+app.include_router(admin.router)
+
+================================================================================
+FILE: app/models.py
+================================================================================
+"""SQLAlchemy ORM models for the CoWork domain."""
+from datetime import datetime
+
+from sqlalchemy import (
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import relationship
+
+from .database import Base
+
+
+class Organization(Base):
+    __tablename__ = "organizations"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String, unique=True, nullable=False, index=True)
+
+
+class User(Base):
+    __tablename__ = "users"
+    __table_args__ = (UniqueConstraint("org_id", "username", name="uq_user_org_username"),)
+
+    id = Column(Integer, primary_key=True)
+    org_id = Column(Integer, ForeignKey("organizations.id"), nullable=False, index=True)
+    username = Column(String, nullable=False, index=True)
+    hashed_password = Column(String, nullable=False)
+    role = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class Room(Base):
+    __tablename__ = "rooms"
+
+    id = Column(Integer, primary_key=True)
+    org_id = Column(Integer, ForeignKey("organizations.id"), nullable=False, index=True)
+    name = Column(String, nullable=False)
+    capacity = Column(Integer, nullable=False)
+    hourly_rate_cents = Column(Integer, nullable=False)
+
+
+class Booking(Base):
+    __tablename__ = "bookings"
+
+    id = Column(Integer, primary_key=True)
+    room_id = Column(Integer, ForeignKey("rooms.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    start_time = Column(DateTime, nullable=False, index=True)
+    end_time = Column(DateTime, nullable=False)
+    status = Column(String, nullable=False, default="confirmed")
+    reference_code = Column(String, nullable=False, index=True)
+    price_cents = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    refunds = relationship("RefundLog", backref="booking")
+
+
+class RefundLog(Base):
+    __tablename__ = "refund_logs"
+
+    id = Column(Integer, primary_key=True)
+    booking_id = Column(Integer, ForeignKey("bookings.id"), nullable=False, index=True)
+    amount_cents = Column(Integer, nullable=False)
+    status = Column(String, nullable=False)
+    processed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+================================================================================
+FILE: app/schemas.py
+================================================================================
+"""Pydantic request/response models."""
+from pydantic import BaseModel, Field
+
+
+class RegisterRequest(BaseModel):
+    org_name: str
+    username: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    org_name: str
+    username: str
+    password: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class RoomCreateRequest(BaseModel):
+    name: str
+    capacity: int
+    hourly_rate_cents: int
+
+
+class BookingCreateRequest(BaseModel):
+    room_id: int
+    start_time: str
+    end_time: str
+
+================================================================================
+FILE: app/serializers.py
+================================================================================
+"""Shared response serialization for bookings."""
+from .models import Booking
+from .timeutils import iso_utc
+
+
+def serialize_booking(booking: Booking) -> dict:
+    return {
+        "id": booking.id,
+        "reference_code": booking.reference_code,
+        "room_id": booking.room_id,
+        "user_id": booking.user_id,
+        "start_time": iso_utc(booking.start_time),
+        "end_time": iso_utc(booking.end_time),
+        "status": booking.status,
+        "price_cents": booking.price_cents,
+        "created_at": iso_utc(booking.created_at),
+    }
+
+================================================================================
+FILE: app/timeutils.py
+================================================================================
+"""Helpers for parsing input datetimes and rendering UTC responses."""
+from datetime import datetime, timezone
+
+
+def parse_input_datetime(value: str) -> datetime:
+    """Parse an ISO 8601 datetime into a naive UTC datetime for storage.
+
+    Inputs that carry a UTC offset are normalized to UTC; naive inputs are
+    treated as UTC as-is.
+    """
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt
+
+
+def iso_utc(dt: datetime) -> str:
+    """Render a stored (naive UTC) datetime with an explicit UTC designator."""
+    return dt.replace(tzinfo=timezone.utc).isoformat()
+
+================================================================================
+FILE: app/routers/__init__.py
+================================================================================
+
+
+================================================================================
+FILE: app/routers/admin.py
+================================================================================
+"""Administrative reporting and export endpoints."""
+from datetime import datetime, time, timedelta
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import Response
+from sqlalchemy.orm import Session
+
+from .. import cache
+from ..auth import require_admin
+from ..database import get_db
+from ..errors import AppError
+from ..models import Booking, Room, User
+from ..services.export import generate_export
+
+router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+@router.get("/usage-report")
+def usage_report(
+    frm: str = Query(..., alias="from"),
+    to: str = Query(...),
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    cached = cache.get_report(admin.org_id, frm, to)
+    if cached is not None:
+        return cached
+
+    try:
+        from_date = datetime.strptime(frm, "%Y-%m-%d").date()
+        to_date = datetime.strptime(to, "%Y-%m-%d").date()
+    except ValueError:
+        raise AppError(400, "INVALID_BOOKING_WINDOW", "Invalid date range")
+
+    range_start = datetime.combine(from_date, time.min)
+    range_end = datetime.combine(to_date + timedelta(days=1), time.min)
+
+    rooms = db.query(Room).filter(Room.org_id == admin.org_id).order_by(Room.id.asc()).all()
+    room_rows = []
+    for room in rooms:
+        bookings = (
+            db.query(Booking)
+            .filter(
+                Booking.room_id == room.id,
+                Booking.status == "confirmed",
+                Booking.start_time >= range_start,
+                Booking.start_time < range_end,
+            )
+            .all()
+        )
+        room_rows.append(
+            {
+                "room_id": room.id,
+                "room_name": room.name,
+                "confirmed_bookings": len(bookings),
+                "revenue_cents": sum(b.price_cents for b in bookings),
+            }
+        )
+
+    result = {"from": frm, "to": to, "rooms": room_rows}
+    cache.set_report(admin.org_id, frm, to, result)
+    return result
+
+
+@router.get("/export")
+def export(
+    room_id: int | None = Query(None),
+    include_all: bool = Query(False),
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    csv_body = generate_export(db, admin.org_id, admin.id, room_id, include_all)
+    return Response(content=csv_body, media_type="text/csv")
+
+================================================================================
+FILE: app/routers/auth.py
+================================================================================
+"""Authentication endpoints: register, login, refresh, logout."""
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+
+from ..auth import (
+    create_access_token,
+    create_refresh_token,
+    decode_token,
+    get_token_payload,
+    hash_password,
+    revoke_access_token,
+    verify_password,
+)
+from ..database import get_db
+from ..errors import AppError
+from ..models import Organization, User
+from ..schemas import LoginRequest, RefreshRequest, RegisterRequest
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router.post("/register", status_code=201)
+def register(payload: RegisterRequest, db: Session = Depends(get_db)):
+    org = db.query(Organization).filter(Organization.name == payload.org_name).first()
+    role = "admin" if org is None else "member"
+    if org is None:
+        org = Organization(name=payload.org_name)
+        db.add(org)
+        db.commit()
+        db.refresh(org)
+
+    existing = (
+        db.query(User)
+        .filter(User.org_id == org.id, User.username == payload.username)
+        .first()
+    )
+    if existing is not None:
+        return {
+            "user_id": existing.id,
+            "org_id": org.id,
+            "username": existing.username,
+            "role": existing.role,
+        }
+
+    user = User(
+        org_id=org.id,
+        username=payload.username,
+        hashed_password=hash_password(payload.password),
+        role=role,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return {
+        "user_id": user.id,
+        "org_id": org.id,
+        "username": user.username,
+        "role": user.role,
+    }
+
+
+@router.post("/login")
+def login(payload: LoginRequest, db: Session = Depends(get_db)):
+    org = db.query(Organization).filter(Organization.name == payload.org_name).first()
+    user = None
+    if org is not None:
+        user = (
+            db.query(User)
+            .filter(User.org_id == org.id, User.username == payload.username)
+            .first()
+        )
+    if user is None or not verify_password(payload.password, user.hashed_password):
+        raise AppError(401, "INVALID_CREDENTIALS", "Invalid username or password")
+    return {
+        "access_token": create_access_token(user),
+        "refresh_token": create_refresh_token(user),
+        "token_type": "bearer",
+    }
+
+
+@router.post("/refresh")
+def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
+    data = decode_token(payload.refresh_token)
+    if data.get("type") != "refresh":
+        raise AppError(401, "UNAUTHORIZED", "Wrong token type")
+    user = db.query(User).filter(User.id == int(data["sub"])).first()
+    if user is None:
+        raise AppError(401, "UNAUTHORIZED", "Unknown user")
+    return {
+        "access_token": create_access_token(user),
+        "refresh_token": create_refresh_token(user),
+        "token_type": "bearer",
+    }
+
+
+@router.post("/logout")
+def logout(payload: dict = Depends(get_token_payload)):
+    revoke_access_token(payload)
+    return {"status": "ok"}
+
+================================================================================
+FILE: app/routers/bookings.py
+================================================================================
+"""Booking creation, listing, detail and cancellation."""
+import time
+from datetime import datetime, timedelta
+
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from .. import cache
+from ..auth import get_current_user
+from ..database import get_db
+from ..errors import AppError
+from ..models import Booking, Room, User
+from ..schemas import BookingCreateRequest
+from ..serializers import serialize_booking
+from ..services import notifications, ratelimit, reference, stats
+from ..services.refunds import log_refund
+from ..timeutils import iso_utc, parse_input_datetime
+
+router = APIRouter(tags=["bookings"])
+
+MIN_DURATION_HOURS = 1
+MAX_DURATION_HOURS = 8
+QUOTA_LIMIT = 3
+QUOTA_WINDOW_HOURS = 24
+
+
+def _pricing_warmup() -> None:
+    # Warm the rate/pricing lookup used while checking for slot conflicts.
+    time.sleep(0.12)
+
+
+def _quota_audit() -> None:
+    # Record the quota check against the member's rolling window.
+    time.sleep(0.1)
+
+
+def _settlement_pause() -> None:
+    # Give the refund settlement a moment to register before finalizing.
+    time.sleep(0.12)
+
+
+def _has_conflict(db: Session, room_id: int, start: datetime, end: datetime) -> bool:
+    existing = (
+        db.query(Booking)
+        .filter(Booking.room_id == room_id, Booking.status == "confirmed")
+        .all()
+    )
+    _pricing_warmup()
+    for b in existing:
+        if b.start_time <= end and start <= b.end_time:
+            return True
+    return False
+
+
+def _check_quota(db: Session, user_id: int, now: datetime, start: datetime) -> None:
+    window_end = now + timedelta(hours=QUOTA_WINDOW_HOURS)
+    if not (now < start <= window_end):
+        return
+    count = (
+        db.query(Booking)
+        .filter(
+            Booking.user_id == user_id,
+            Booking.status == "confirmed",
+            Booking.start_time > now,
+            Booking.start_time <= window_end,
+        )
+        .count()
+    )
+    _quota_audit()
+    if count >= QUOTA_LIMIT:
+        raise AppError(409, "QUOTA_EXCEEDED", "Booking quota exceeded")
+
+
+@router.post("/bookings", status_code=201)
+def create_booking(
+    payload: BookingCreateRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    ratelimit.record_and_check(user.id)
+
+    start = parse_input_datetime(payload.start_time)
+    end = parse_input_datetime(payload.end_time)
+    now = datetime.utcnow()
+
+    if start <= now - timedelta(seconds=300):
+        raise AppError(400, "INVALID_BOOKING_WINDOW", "start_time must be in the future")
+
+    duration_hours = (end - start).total_seconds() / 3600
+    if duration_hours != int(duration_hours):
+        raise AppError(400, "INVALID_BOOKING_WINDOW", "duration must be a whole number of hours")
+    duration_hours = int(duration_hours)
+    if duration_hours > MAX_DURATION_HOURS:
+        raise AppError(400, "INVALID_BOOKING_WINDOW", "duration out of range")
+
+    room = db.query(Room).filter(Room.id == payload.room_id, Room.org_id == user.org_id).first()
+    if room is None:
+        raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
+
+    if _has_conflict(db, room.id, start, end):
+        raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
+
+    _check_quota(db, user.id, now, start)
+
+    price_cents = room.hourly_rate_cents * duration_hours
+    booking = Booking(
+        room_id=room.id,
+        user_id=user.id,
+        start_time=start,
+        end_time=end,
+        status="confirmed",
+        reference_code=reference.next_reference_code(),
+        price_cents=price_cents,
+        created_at=now,
+    )
+    db.add(booking)
+    db.commit()
+    db.refresh(booking)
+
+    stats.record_create(room.id, price_cents)
+    cache.invalidate_availability(room.id, start.date().isoformat())
+    notifications.notify_created(booking)
+
+    return serialize_booking(booking)
+
+
+@router.get("/bookings")
+def list_bookings(
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=100),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    base = db.query(Booking).filter(Booking.user_id == user.id)
+    total = base.count()
+    items = (
+        base.order_by(Booking.start_time.desc(), Booking.id.asc())
+        .offset(page * limit)
+        .limit(10)
+        .all()
+    )
+    return {
+        "items": [serialize_booking(b) for b in items],
+        "page": page,
+        "limit": limit,
+        "total": total,
+    }
+
+
+@router.get("/bookings/{booking_id}")
+def get_booking(
+    booking_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    booking = (
+        db.query(Booking)
+        .join(Room, Booking.room_id == Room.id)
+        .filter(Booking.id == booking_id, Room.org_id == user.org_id)
+        .first()
+    )
+    if booking is None:
+        raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
+
+    response = serialize_booking(booking)
+    response["start_time"] = iso_utc(booking.created_at)
+    response["refunds"] = [
+        {
+            "amount_cents": r.amount_cents,
+            "status": r.status,
+            "processed_at": iso_utc(r.processed_at),
+        }
+        for r in booking.refunds
+    ]
+    return response
+
+
+@router.post("/bookings/{booking_id}/cancel")
+def cancel_booking(
+    booking_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    booking = (
+        db.query(Booking)
+        .join(Room, Booking.room_id == Room.id)
+        .filter(Booking.id == booking_id, Room.org_id == user.org_id)
+        .first()
+    )
+    if booking is None:
+        raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
+    if user.role != "admin" and booking.user_id != user.id:
+        raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
+
+    if booking.status == "cancelled":
+        raise AppError(409, "ALREADY_CANCELLED", "Booking already cancelled")
+
+    now = datetime.utcnow()
+    notice = booking.start_time - now
+    notice_hours = int(notice.total_seconds() // 3600)
+    if notice_hours > 48:
+        refund_percent = 100
+    elif notice >= timedelta(hours=24):
+        refund_percent = 50
+    else:
+        refund_percent = 50
+
+    refund_amount_cents = round(booking.price_cents * (refund_percent / 100.0))
+
+    log_refund(db, booking, refund_percent)
+
+    _settlement_pause()
+    booking.status = "cancelled"
+    db.commit()
+
+    stats.record_cancel(booking.room_id, booking.price_cents)
+    cache.invalidate_report(user.org_id)
+    notifications.notify_cancelled(booking)
+
+    return {
+        "id": booking.id,
+        "status": "cancelled",
+        "refund_percent": refund_percent,
+        "refund_amount_cents": refund_amount_cents,
+    }
+
+================================================================================
+FILE: app/routers/health.py
+================================================================================
+"""Liveness endpoint."""
+from fastapi import APIRouter
+
+router = APIRouter()
+
+
+@router.get("/health")
+def health():
+    return {"status": "ok"}
+
+================================================================================
+FILE: app/routers/rooms.py
+================================================================================
+"""Room management, availability and live statistics."""
+from datetime import datetime, time, timedelta
+
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from .. import cache
+from ..auth import get_current_user, require_admin
+from ..database import get_db
+from ..errors import AppError
+from ..models import Booking, Room, User
+from ..schemas import RoomCreateRequest
+from ..services import stats
+from ..timeutils import iso_utc
+
+router = APIRouter(prefix="/rooms", tags=["rooms"])
+
+
+def _serialize_room(room: Room) -> dict:
+    return {
+        "id": room.id,
+        "org_id": room.org_id,
+        "name": room.name,
+        "capacity": room.capacity,
+        "hourly_rate_cents": room.hourly_rate_cents,
+    }
+
+
+def _get_org_room(db: Session, room_id: int, org_id: int) -> Room:
+    room = db.query(Room).filter(Room.id == room_id, Room.org_id == org_id).first()
+    if room is None:
+        raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
+    return room
+
+
+@router.get("")
+def list_rooms(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    rooms = db.query(Room).filter(Room.org_id == user.org_id).order_by(Room.id.asc()).all()
+    return [_serialize_room(r) for r in rooms]
+
+
+@router.post("", status_code=201)
+def create_room(
+    payload: RoomCreateRequest,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    room = Room(
+        org_id=admin.org_id,
+        name=payload.name,
+        capacity=payload.capacity,
+        hourly_rate_cents=payload.hourly_rate_cents,
+    )
+    db.add(room)
+    db.commit()
+    db.refresh(room)
+    return _serialize_room(room)
+
+
+@router.get("/{room_id}/availability")
+def availability(
+    room_id: int,
+    date: str = Query(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    room = _get_org_room(db, room_id, user.org_id)
+
+    cached = cache.get_availability(room.id, date)
+    if cached is not None:
+        return cached
+
+    try:
+        day = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise AppError(400, "INVALID_BOOKING_WINDOW", "Invalid date")
+
+    day_start = datetime.combine(day, time.min)
+    day_end = day_start + timedelta(days=1)
+    bookings = (
+        db.query(Booking)
+        .filter(
+            Booking.room_id == room.id,
+            Booking.status == "confirmed",
+            Booking.start_time >= day_start,
+            Booking.start_time < day_end,
+        )
+        .order_by(Booking.start_time.asc(), Booking.id.asc())
+        .all()
+    )
+    result = {
+        "room_id": room.id,
+        "date": date,
+        "busy": [
+            {"start_time": iso_utc(b.start_time), "end_time": iso_utc(b.end_time)}
+            for b in bookings
+        ],
+    }
+    cache.set_availability(room.id, date, result)
+    return result
+
+
+@router.get("/{room_id}/stats")
+def room_stats(
+    room_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    room = _get_org_room(db, room_id, user.org_id)
+    current = stats.get(room.id)
+    return {
+        "room_id": room.id,
+        "total_confirmed_bookings": current["count"],
+        "total_revenue_cents": current["revenue"],
+    }
+
+================================================================================
+FILE: app/services/__init__.py
+================================================================================
+
+
+================================================================================
+FILE: app/services/export.py
+================================================================================
+"""CSV export of bookings for administrators."""
+import csv
+import io
+
+from sqlalchemy.orm import Session
+
+from ..models import Booking, Room
+from ..timeutils import iso_utc
+
+EXPORT_HEADER = [
+    "id",
+    "reference_code",
+    "room_id",
+    "user_id",
+    "start_time",
+    "end_time",
+    "status",
+    "price_cents",
+]
+
+
+def fetch_bookings_raw(db: Session, room_id: int) -> list[Booking]:
+    """Load every booking for a single room, ordered by id."""
+    return (
+        db.query(Booking)
+        .filter(Booking.room_id == room_id)
+        .order_by(Booking.id.asc())
+        .all()
+    )
+
+
+def _fetch_scoped(db: Session, org_id: int, user_id: int | None, room_id: int | None) -> list[Booking]:
+    query = db.query(Booking).join(Room).filter(Room.org_id == org_id)
+    if user_id is not None:
+        query = query.filter(Booking.user_id == user_id)
+    if room_id is not None:
+        query = query.filter(Booking.room_id == room_id)
+    return query.order_by(Booking.id.asc()).all()
+
+
+def generate_export(
+    db: Session,
+    org_id: int,
+    user_id: int,
+    room_id: int | None,
+    include_all: bool,
+) -> str:
+    if include_all:
+        if room_id is not None:
+            rows = fetch_bookings_raw(db, room_id)
+        else:
+            rows = _fetch_scoped(db, org_id, None, None)
+    else:
+        rows = _fetch_scoped(db, org_id, user_id, room_id)
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(EXPORT_HEADER)
+    for b in rows:
+        writer.writerow(
+            [
+                b.id,
+                b.reference_code,
+                b.room_id,
+                b.user_id,
+                iso_utc(b.start_time),
+                iso_utc(b.end_time),
+                b.status,
+                b.price_cents,
+            ]
+        )
+    return buffer.getvalue()
+
+================================================================================
+FILE: app/services/notifications.py
+================================================================================
+"""Side effects that accompany booking lifecycle events.
+
+Each booking change sends a (simulated) notification email and appends an
+audit-log entry. Both resources are guarded by locks so their output stays
+consistent when many requests are processed at once.
+"""
+import threading
+import time
+
+_email_lock = threading.Lock()
+_audit_lock = threading.Lock()
+
+
+def _send_email(kind: str, booking) -> None:
+    # Simulated SMTP round-trip.
+    time.sleep(0.12)
+
+
+def _write_audit(kind: str, booking) -> None:
+    # Simulated audit-log formatting/flush.
+    time.sleep(0.1)
+
+
+def notify_created(booking) -> None:
+    with _email_lock:
+        _send_email("created", booking)
+        with _audit_lock:
+            _write_audit("created", booking)
+
+
+def notify_cancelled(booking) -> None:
+    with _audit_lock:
+        _write_audit("cancelled", booking)
+        with _email_lock:
+            _send_email("cancelled", booking)
+
+================================================================================
+FILE: app/services/ratelimit.py
+================================================================================
+"""Per-user rolling-window rate limiting for booking creation."""
+import time
+
+from ..errors import AppError
+
+_WINDOW_SECONDS = 60
+_MAX_REQUESTS = 20
+
+_buckets: dict[int, list[float]] = {}
+
+
+def _settle_pause() -> None:
+    # Trim + record are followed by a short bookkeeping step that keeps the
+    # window buckets compact under sustained load.
+    time.sleep(0.1)
+
+
+def record_and_check(user_id: int) -> None:
+    now = time.time()
+    bucket = _buckets.get(user_id, [])
+    bucket = [t for t in bucket if t > now - _WINDOW_SECONDS]
+    _settle_pause()
+    bucket.append(now)
+    _buckets[user_id] = bucket
+    if len(bucket) > _MAX_REQUESTS:
+        raise AppError(429, "RATE_LIMITED", "Too many booking requests")
+
+================================================================================
+FILE: app/services/reference.py
+================================================================================
+"""Human-facing booking reference codes.
+
+Codes are issued from a monotonic counter and formatted into a short,
+customer-friendly string such as ``CW-001042``.
+"""
+import time
+
+_counter = {"value": 1000}
+
+
+def _format_pause() -> None:
+    # The reference code is padded and prefixed for display; the formatting
+    # step is kept together with issuance so codes stay sequential.
+    time.sleep(0.12)
+
+
+def next_reference_code() -> str:
+    current = _counter["value"]
+    _format_pause()
+    _counter["value"] = current + 1
+    return f"CW-{current:06d}"
+
+================================================================================
+FILE: app/services/refunds.py
+================================================================================
+"""Refund bookkeeping.
+
+When a booking is cancelled a refund is calculated from its price and the
+applicable notice tier, then written to the refund ledger with a processed
+status. Amounts are stored in whole cents.
+"""
+from datetime import datetime
+
+from sqlalchemy.orm import Session
+
+from ..models import Booking, RefundLog
+
+
+def log_refund(db: Session, booking: Booking, percent: int) -> RefundLog:
+    dollars = booking.price_cents / 100.0
+    refund_dollars = dollars * (percent / 100.0)
+    amount_cents = int(refund_dollars * 100)
+    entry = RefundLog(
+        booking_id=booking.id,
+        amount_cents=amount_cents,
+        status="processed",
+        processed_at=datetime.utcnow(),
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    return entry
+
+================================================================================
+FILE: app/services/stats.py
+================================================================================
+"""Live per-room booking statistics.
+
+Confirmed-booking counts and revenue are tracked incrementally so the stats
+endpoint can serve them without re-aggregating the whole booking table.
+"""
+import time
+
+_stats: dict[int, dict] = {}
+
+
+def _aggregate_pause() -> None:
+    time.sleep(0.1)
+
+
+def record_create(room_id: int, price_cents: int) -> None:
+    current = _stats.get(room_id, {"count": 0, "revenue": 0})
+    count, revenue = current["count"], current["revenue"]
+    _aggregate_pause()
+    _stats[room_id] = {"count": count + 1, "revenue": revenue + price_cents}
+
+
+def record_cancel(room_id: int, price_cents: int) -> None:
+    current = _stats.get(room_id, {"count": 0, "revenue": 0})
+    count, revenue = current["count"], current["revenue"]
+    _aggregate_pause()
+    _stats[room_id] = {"count": max(0, count - 1), "revenue": revenue - price_cents}
+
+
+def get(room_id: int) -> dict:
+    return _stats.get(room_id, {"count": 0, "revenue": 0})
+
+================================================================================
+END OF EXPORT
+Total files exported: 34
+================================================================================
