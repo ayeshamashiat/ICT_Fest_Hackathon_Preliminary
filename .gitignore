@@ -4,3 +4,6 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+ICT_Fest_Hackathon_Preliminary.pdf/
+export_codebase.py/
+codebase_export.txt/
