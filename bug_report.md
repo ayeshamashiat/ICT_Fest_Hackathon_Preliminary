@@ -788,6 +788,31 @@ booking_id = Column(Integer, ForeignKey("bookings.id"), nullable=False, index=Tr
 
 ---
 
+## Bug #21: Multi-Tenancy Data Leak in Admin Export (HARD)
+
+**File(s):** `app/routers/admin.py`, lines 65-74 and `app/services/export.py`, lines 48-50
+
+**Issue:**
+The admin export endpoint `/admin/export` fails to validate whether the optional query parameter `room_id` belongs to the requesting administrator's organization. This allows an administrator to bypass tenant isolation and export all booking data from rooms belonging to other organizations.
+
+**Expected Behavior (Business Rule 9):**
+"A user (including admins) may only ever read or act on data belonging to their own organization, on every code path. Cross-org resource IDs behave as non-existent (→ 404)."
+
+**Why It's Wrong:**
+- If an admin passes `room_id=X` where room `X` belongs to another tenant organization, and `include_all=True`, `generate_export` calls `fetch_bookings_raw(db, room_id)` which retrieves all bookings for room `X` directly, leaking sensitive cross-tenant data.
+- It fails to raise `404 ROOM_NOT_FOUND` as mandated by Business Rule 9.
+
+**Fix:**
+Validate that the `room_id` belongs to the admin's organization:
+```python
+    if room_id is not None:
+        room = db.query(Room).filter(Room.id == room_id, Room.org_id == admin.org_id).first()
+        if room is None:
+            raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
+```
+
+---
+
 ## Summary by Difficulty
 
 ### Easy (3 points)
@@ -803,7 +828,8 @@ booking_id = Column(Integer, ForeignKey("bookings.id"), nullable=False, index=Tr
 - Subtle Bug #5: Reference code not unique + race condition
 - Subtle Bug #6: Stats not thread-safe
 - Subtle Bug #7: Rate limiter not thread-safe
+- Subtle Bug #9: Multi-Tenancy Data Leak in Admin Export
 
-**Total: 1 Easy (3 pts) + 2 Medium (10 pts) + 5 Hard (50 pts) = 63 points**
+**Total: 1 Easy (3 pts) + 2 Medium (10 pts) + 6 Hard (60 pts) = 73 points**
 
 These are production-critical bugs related to security, concurrency, and data integrity.
